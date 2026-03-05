@@ -16,6 +16,11 @@ public partial class Planet : Node3D
     [Export] public bool useSnyder = false; // Toggle between projections
     [Export] public bool autoGenerate = true; // Generate on _Ready
     [Export] public bool showStatistics = true; // Print statistics to console
+    [Export] public int majorPlateCount = 7; // Number of major tectonic plates
+    [Export] public int minorPlateCount = 5; // Number of minor tectonic plates
+    [Export] public int minorPlateMaxSize = 20; // Max hexes per minor plate
+    [Export] public bool generatePlates = true; // Auto-generate tectonic plates
+    [Export(PropertyHint.Range, "0.0,1.0,")] public float continentalPlateWeight = 0.35f; // Probability of major plate being continental (vs oceanic)
     #endregion
 
     #region Private Fields
@@ -25,6 +30,12 @@ public partial class Planet : Node3D
     private int invalidCenterCount = 0;
     private int hexagonCount = 0;
     private int pentagonCount = 0;
+    private Dictionary<string, int> hexToPlateId = new Dictionary<string, int>();
+    private List<TectonicPlate> plates = new List<TectonicPlate>();
+    private Dictionary<string, float> hexTectonicHeights = new Dictionary<string, float>();
+    private Dictionary<int, List<Hexagon>> cellsByFace = new Dictionary<int, List<Hexagon>>();
+    private Hexagon lastNearestCellCache = null;
+    private Vector3 lastNearestDirectionCache = Vector3.Zero;
     #endregion
 
     #region Public Properties
@@ -33,6 +44,8 @@ public partial class Planet : Node3D
     public int HexagonCount => hexagonCount;
     public int PentagonCount => pentagonCount;
     public float SeaLevel { get; private set; } = 0.5f;
+    public IReadOnlyList<TectonicPlate> Plates => plates;
+    public bool HasTectonicHeights => hexTectonicHeights.Count > 0;
     #endregion
 
     #region Godot Lifecycle
@@ -94,6 +107,11 @@ public partial class Planet : Node3D
                         allCells.Add(hex);
                         cellsById[hexId] = hex;
 
+                        // Add to face-based spatial partition
+                        if (!cellsByFace.ContainsKey(face))
+                            cellsByFace[face] = new List<Hexagon>();
+                        cellsByFace[face].Add(hex);
+
                         bool isPentagon = IsPentagon(hex);
 
                         if (isPentagon)
@@ -114,6 +132,13 @@ public partial class Planet : Node3D
             PrintAreaStatistics();
         }
 
+        // Generate tectonic plates if enabled
+        if (generatePlates)
+        {
+            GenerateTectonicPlates();
+            GenerateTectonicHeights();
+        }
+
         // Calculate sea level from heightmap if available
         CalculateSeaLevel();
     }
@@ -125,6 +150,11 @@ public partial class Planet : Node3D
     {
         allCells.Clear();
         cellsById.Clear();
+        hexToPlateId.Clear();
+        plates.Clear();
+        hexTectonicHeights.Clear();
+        cellsByFace.Clear();
+        lastNearestCellCache = null;
         invalidCenterCount = 0;
         hexagonCount = 0;
         pentagonCount = 0;
@@ -209,6 +239,15 @@ public partial class Planet : Node3D
             return null;
 
         Vector3 dir = localDirection.Normalized();
+
+        // Check cache first - if we're querying the same/very similar direction
+        if (lastNearestCellCache != null && lastNearestDirectionCache.DistanceSquaredTo(dir) < 0.0001f)
+        {
+            return lastNearestCellCache;
+        }
+
+        // Just do a full search - it's simpler and more reliable
+        // The cache will handle repeated queries efficiently
         float bestDot = float.MinValue;
         Hexagon bestCell = null;
 
@@ -222,6 +261,10 @@ public partial class Planet : Node3D
                 bestCell = cell;
             }
         }
+
+        // Cache result
+        lastNearestCellCache = bestCell;
+        lastNearestDirectionCache = dir;
 
         return bestCell;
     }
@@ -288,6 +331,355 @@ public partial class Planet : Node3D
         var generator = GetHeightmapGenerator();
         return generator?.GetRawHeightAtPosition(worldPosition) ?? 0f;
     }
+
+    /// <summary>
+    /// Gets the plate ID for a given hex ID. Returns -1 if no plate found.
+    /// </summary>
+    public int GetPlateIdForHex(string hexId)
+    {
+        return hexToPlateId.TryGetValue(hexId, out int plateId) ? plateId : -1;
+    }
+
+    /// <summary>
+    /// Gets the plate for a given hex ID. Returns null if no plate found.
+    /// </summary>
+    public TectonicPlate GetPlateForHex(string hexId)
+    {
+        int plateId = GetPlateIdForHex(hexId);
+        if (plateId >= 0 && plateId < plates.Count)
+            return plates[plateId];
+        return null;
+    }
+
+    /// <summary>
+    /// Gets the tectonic height for a given hex ID. Returns 0.5 if no height data available.
+    /// </summary>
+    public float GetTectonicHeightAtHex(string hexId)
+    {
+        return hexTectonicHeights.TryGetValue(hexId, out float height) ? height : 0.5f;
+    }
+
+    /// <summary>
+    /// Gets the tectonic height for a given hex. Returns 0.5 if no height data available.
+    /// </summary>
+    public float GetTectonicHeightAtHex(Hexagon hex)
+    {
+        return GetTectonicHeightAtHex(hex.ToStrId());
+    }
+    #endregion
+
+    #region Private Methods - Tectonic Plates
+    /// <summary>
+    /// Generates tectonic plates using round-robin flood-fill growth.
+    /// Each plate takes turns growing one step until the planet is covered.
+    /// </summary>
+    private void GenerateTectonicPlates()
+    {
+        hexToPlateId.Clear();
+        plates.Clear();
+
+        if (allCells.Count == 0)
+            return;
+
+        var random = new Random();
+        var unassignedHexIds = new HashSet<string>(cellsById.Keys);
+        var plateFrontiers = new List<Queue<string>>(); // Frontier for each plate
+
+        // Create major plates with seed hexes
+        for (int i = 0; i < majorPlateCount && unassignedHexIds.Count > 0; i++)
+        {
+            int randomIdx = random.Next(unassignedHexIds.Count);
+            string seedHexId = unassignedHexIds.ElementAt(randomIdx);
+            
+            var plate = new TectonicPlate 
+            { 
+                plateId = i, 
+                isMajor = true,
+                type = random.NextDouble() < continentalPlateWeight ? PlateType.Continental : PlateType.Oceanic,
+                driftLatitude = (random.NextDouble() * 180.0) - 90.0,  // -90 to 90
+                driftLongitude = (random.NextDouble() * 360.0) - 180.0, // -180 to 180
+                driftSpeed = (float)(random.NextDouble() * 2.0 + 0.5) // 0.5 to 2.5
+            };
+            plates.Add(plate);
+            
+            hexToPlateId[seedHexId] = i;
+            plate.hexIds.Add(seedHexId);
+            unassignedHexIds.Remove(seedHexId);
+            
+            var frontier = new Queue<string>();
+            frontier.Enqueue(seedHexId);
+            plateFrontiers.Add(frontier);
+        }
+
+        // Create minor plates with seed hexes
+        for (int i = 0; i < minorPlateCount && unassignedHexIds.Count > 0; i++)
+        {
+            int randomIdx = random.Next(unassignedHexIds.Count);
+            string seedHexId = unassignedHexIds.ElementAt(randomIdx);
+            
+            // Minor plates have 50% chance to be Continental/Oceanic, 50% chance to be Micro
+            PlateType minorPlateType;
+            if (random.NextDouble() < 0.5)
+            {
+                // Use same continental weight as major plates
+                minorPlateType = random.NextDouble() < continentalPlateWeight ? PlateType.Continental : PlateType.Oceanic;
+            }
+            else
+            {
+                minorPlateType = PlateType.Micro;
+            }
+            
+            var plate = new TectonicPlate 
+            { 
+                plateId = majorPlateCount + i, 
+                isMajor = false,
+                type = minorPlateType,
+                driftLatitude = (random.NextDouble() * 180.0) - 90.0,
+                driftLongitude = (random.NextDouble() * 360.0) - 180.0,
+                driftSpeed = (float)(random.NextDouble() * 1.5 + 0.3) // 0.3 to 1.8 (slower than major)
+            };
+            plates.Add(plate);
+            
+            hexToPlateId[seedHexId] = majorPlateCount + i;
+            plate.hexIds.Add(seedHexId);
+            unassignedHexIds.Remove(seedHexId);
+            
+            var frontier = new Queue<string>();
+            frontier.Enqueue(seedHexId);
+            plateFrontiers.Add(frontier);
+        }
+
+        // Round-robin growth: each plate expands one step per round
+        while (unassignedHexIds.Count > 0)
+        {
+            bool anyExpansion = false;
+
+            for (int plateIdx = 0; plateIdx < plateFrontiers.Count; plateIdx++)
+            {
+                var frontier = plateFrontiers[plateIdx];
+                var plate = plates[plateIdx];
+                
+                if (frontier.Count == 0)
+                    continue;
+
+                // Skip if this is a minor plate that has reached max size
+                if (!plate.isMajor && plate.hexIds.Count >= minorPlateMaxSize)
+                    continue;
+
+                // Expand one step for this plate
+                string currentHexId = frontier.Dequeue();
+                Hexagon currentHex = cellsById[currentHexId];
+                var neighbors = GetNeighbors(currentHex);
+
+                foreach (Hexagon neighbor in neighbors)
+                {
+                    // Stop if minor plate would exceed max size
+                    if (!plate.isMajor && plate.hexIds.Count >= minorPlateMaxSize)
+                        break;
+
+                    string neighborId = neighbor.ToStrId();
+
+                    if (!unassignedHexIds.Contains(neighborId))
+                        continue; // Already assigned to a plate
+
+                    // Assign to this plate
+                    hexToPlateId[neighborId] = plate.plateId;
+                    plate.hexIds.Add(neighborId);
+                    unassignedHexIds.Remove(neighborId);
+                    frontier.Enqueue(neighborId);
+                    anyExpansion = true;
+                }
+            }
+
+            // If no plate expanded, break to avoid infinite loop
+            if (!anyExpansion)
+                break;
+        }
+
+        // Assign remaining hexes to nearest plate
+        foreach (string hexId in unassignedHexIds.ToList())
+        {
+            AssignToNearestPlate(hexId);
+        }
+
+        if (showStatistics)
+        {
+            GD.Print($"Generated {plates.Count} tectonic plates ({majorPlateCount} major, {minorPlateCount} minor)");
+            for (int i = 0; i < plates.Count; i++)
+            {
+                var plate = plates[i];
+                GD.Print($"  Plate {i}: {plate.hexIds.Count} cells, type={plate.type}, drift=({plate.driftLatitude:F1}°, {plate.driftLongitude:F1}°), speed={plate.driftSpeed:F2}");
+            }
+        }
+    }
+
+    private void AssignToNearestPlate(string hexHexId)
+    {
+        if (hexToPlateId.ContainsKey(hexHexId))
+            return; // Already assigned
+
+        Hexagon hex = cellsById[hexHexId];
+        var neighbors = GetNeighbors(hex);
+
+        foreach (Hexagon neighbor in neighbors)
+        {
+            string neighborId = neighbor.ToStrId();
+            if (hexToPlateId.TryGetValue(neighborId, out int plateId))
+            {
+                hexToPlateId[hexHexId] = plateId;
+                plates[plateId].hexIds.Add(hexHexId);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Generates tectonic-based heights for all hexes.
+    /// Base heights depend on plate type, with adjustments at plate boundaries.
+    /// </summary>
+    private void GenerateTectonicHeights()
+    {
+        hexTectonicHeights.Clear();
+
+        if (plates.Count == 0 || allCells.Count == 0)
+            return;
+
+        // Step 1: Set base heights for all hexes based on plate type
+        foreach (var hex in allCells)
+        {
+            string hexId = hex.ToStrId();
+            var plate = GetPlateForHex(hexId);
+            
+            if (plate == null)
+            {
+                hexTectonicHeights[hexId] = 0.5f; // Default for unassigned
+                continue;
+            }
+
+            // Base heights: Continental=0.6, Oceanic=0.4, Micro=0.5
+            float baseHeight = plate.type switch
+            {
+                PlateType.Continental => 0.65f,
+                PlateType.Oceanic => 0.35f,
+                PlateType.Micro => 0.5f,
+                _ => 0.5f
+            };
+
+            hexTectonicHeights[hexId] = baseHeight;
+        }
+
+        // Step 2: Adjust heights at plate boundaries
+        foreach (var hex in allCells)
+        {
+            string hexId = hex.ToStrId();
+            var plate = GetPlateForHex(hexId);
+            
+            if (plate == null)
+                continue;
+
+            var neighbors = GetNeighbors(hex);
+            Vector3 hexPos = CellToCartesian(hex);
+
+            foreach (var neighbor in neighbors)
+            {
+                string neighborId = neighbor.ToStrId();
+                var neighborPlate = GetPlateForHex(neighborId);
+
+                // Skip if same plate or neighbor has no plate
+                if (neighborPlate == null || neighborPlate.plateId == plate.plateId)
+                    continue;
+
+                // This is a boundary hex - calculate interaction type
+                Vector3 neighborPos = CellToCartesian(neighbor);
+                float heightAdjustment = CalculateBoundaryHeightAdjustment(
+                    hex, hexPos, plate, 
+                    neighbor, neighborPos, neighborPlate
+                );
+
+                // Apply adjustment (take maximum if multiple boundaries)
+                float currentHeight = hexTectonicHeights[hexId];
+                hexTectonicHeights[hexId] = Mathf.Max(currentHeight, currentHeight + heightAdjustment);
+            }
+        }
+
+        // Clamp all heights to valid range
+        foreach (var hexId in hexTectonicHeights.Keys.ToList())
+        {
+            hexTectonicHeights[hexId] = Mathf.Clamp(hexTectonicHeights[hexId], 0.0f, 1.0f);
+        }
+
+        if (showStatistics)
+        {
+            var heights = hexTectonicHeights.Values.ToList();
+            float minHeight = heights.Min();
+            float maxHeight = heights.Max();
+            float avgHeight = heights.Average();
+            GD.Print($"Tectonic heights generated: min={minHeight:F3}, max={maxHeight:F3}, avg={avgHeight:F3}");
+        }
+    }
+
+    /// <summary>
+    /// Calculates height adjustment at a plate boundary based on plate types and convergence.
+    /// </summary>
+    private float CalculateBoundaryHeightAdjustment(
+        Hexagon hex, Vector3 hexPos, TectonicPlate plate,
+        Hexagon neighbor, Vector3 neighborPos, TectonicPlate neighborPlate)
+    {
+        // Calculate boundary normal (pointing from hex toward neighbor)
+        Vector3 boundaryNormal = (neighborPos - hexPos).Normalized();
+
+        // Convert plate drift directions to 3D vectors
+        Vector3 plateDrift = SphericalGeometry.LatLonToVector3(plate.driftLatitude, plate.driftLongitude).Normalized();
+        Vector3 neighborDrift = SphericalGeometry.LatLonToVector3(neighborPlate.driftLatitude, neighborPlate.driftLongitude).Normalized();
+
+        // Calculate relative motion along boundary normal
+        // Positive = convergent (plates moving toward each other)
+        // Negative = divergent (plates moving apart)
+        float plateTowardBoundary = plateDrift.Dot(boundaryNormal) * plate.driftSpeed;
+        float neighborTowardBoundary = neighborDrift.Dot(-boundaryNormal) * neighborPlate.driftSpeed;
+        float convergence = plateTowardBoundary + neighborTowardBoundary;
+
+        // Determine interaction type and calculate height adjustment
+        if (convergence > 0.6f) // Convergent boundary
+        {
+            if (plate.type == PlateType.Continental && neighborPlate.type == PlateType.Continental)
+            {
+                // Continental-Continental: Major mountain building
+                return 0.25f; // Can reach up to 0.95-1.0
+            }
+            else if (plate.type == PlateType.Continental && neighborPlate.type == PlateType.Oceanic)
+            {
+                // Continental side: Volcanic arc mountains
+                return 0.05f; // Continental rises to ~0.65 (volcanic arc)
+            }
+            else if (plate.type == PlateType.Oceanic && neighborPlate.type == PlateType.Continental)
+            {
+                // Oceanic side: Subduction, oceanic plate goes down
+                return -0.15f; // Oceanic drops to ~0.25 (trench)
+            }
+            else if (plate.type == PlateType.Oceanic && neighborPlate.type == PlateType.Oceanic)
+            {
+                // Oceanic-Oceanic: Island arcs
+                return 0.15f; // Forms islands at ~0.55
+            }
+        }
+        else if (convergence < -0.6f) // Divergent boundary
+        {
+            if (plate.type == PlateType.Oceanic && neighborPlate.type == PlateType.Oceanic)
+            {
+                // Mid-ocean ridge: Slight elevation
+                return 0.05f; // Rises slightly to ~0.45
+            }
+            else if (plate.type == PlateType.Continental || neighborPlate.type == PlateType.Continental)
+            {
+                // Continental rift: Lowering
+                return -0.05f; // Drops to ~0.55 (rift valley)
+            }
+        }
+
+        // Transform boundary or minimal interaction
+        return 0.0f;
+    }
     #endregion
 
     #region Private Methods - Cell Type Detection
@@ -334,9 +726,9 @@ public partial class Planet : Node3D
             return;
         }
 
-        // Sort heights and find the 60th percentile (lower 60% underwater)
+        // Sort heights and find the 60th percentile (lower 55% underwater)
         heights.Sort();
-        int percentileIndex = (int)(heights.Count * 0.6);
+        int percentileIndex = (int)(heights.Count * 0.55);
         percentileIndex = Mathf.Clamp(percentileIndex, 0, heights.Count - 1);
         
         SeaLevel = heights[percentileIndex];

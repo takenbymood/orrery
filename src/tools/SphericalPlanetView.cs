@@ -4,6 +4,18 @@ using System.Collections.Generic;
 using System.Linq;
 
 /// <summary>
+/// Visualization mode for the planet view
+/// </summary>
+public enum PlanetVisualizationMode
+{
+    PlainHexagons,      // Show hexagons with simple hex/pentagon colors
+    Heightmap,          // Show heightmap with water/land vertex coloring
+    TectonicPlates,     // Show tectonic plates with distinct colors
+    TectonicHeightmap,  // Show tectonic-based heightmap with vertex coloring
+    TectonicTexture     // Show pre-sampled tectonic texture (blue to red)
+}
+
+/// <summary>
 /// Spherical planet visualization layer. Renders a Planet's hex grid data
 /// using polygon meshes or markers. Handles hover highlighting via mouse interaction.
 /// </summary>
@@ -18,10 +30,10 @@ public partial class SphericalPlanetView : Node3D
     [Export] public Color hexColor = new Color(0.2f, 0.45f, 0.95f);
     [Export] public Color pentagonColor = new Color(0.9f, 0.2f, 0.2f);
     [Export] public Color highlightColor = new Color(1.0f, 0.95f, 0.2f);
-    [Export] public bool useHeightmapColoring = false; // Enable heightmap-based vertex colors
     [Export] public Color waterColor = new Color(0.1f, 0.3f, 0.7f); // Color for ocean (below sea level)
     [Export] public Color lowLandColor = new Color(0.2f, 0.6f, 0.2f); // Color for low land (at sea level)
     [Export] public Color highLandColor = new Color(0.9f, 0.9f, 0.9f); // Color for high mountains
+    [Export] public PlanetVisualizationMode visualizationMode = PlanetVisualizationMode.PlainHexagons;
     #endregion
 
     #region Private Fields
@@ -72,6 +84,65 @@ public partial class SphericalPlanetView : Node3D
         ClearRender();
         invalidCenterCount = 0;
 
+        switch (visualizationMode)
+        {
+            case PlanetVisualizationMode.PlainHexagons:
+                RenderPlainVisualization();
+                break;
+            case PlanetVisualizationMode.Heightmap:
+                RenderHeightmapVisualization();
+                break;
+            case PlanetVisualizationMode.TectonicPlates:
+                RenderPlateVisualization();
+                break;
+            case PlanetVisualizationMode.TectonicHeightmap:
+                RenderTectonicHeightmapVisualization();
+                break;
+            case PlanetVisualizationMode.TectonicTexture:
+                RenderTectonicTextureVisualization();
+                break;
+            default:
+                RenderPlainVisualization();
+                break;
+        }
+
+        if (invalidCenterCount > 0)
+            GD.PrintErr($"Skipped {invalidCenterCount} cells during rendering due to non-finite projection results.");
+    }
+
+    private void RenderPlainVisualization()
+    {
+        // Create a single surface tool for the entire planet
+        var surfaceTool = new SurfaceTool();
+        surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
+
+        foreach (Hexagon cell in planet.AllCells)
+        {
+            bool isPentagon = IsPentagon(cell);
+            Color cellColor = isPentagon ? pentagonColor : hexColor;
+            
+            if (showMarkers)
+                CreateCellMarkerGeometry(cell, cellColor, surfaceTool);
+            else
+                CreateCellPolygonGeometryPlain(cell, cellColor, surfaceTool);
+        }
+
+        // Commit the combined mesh
+        var planetMesh = surfaceTool.Commit();
+        planetMeshInstance = new MeshInstance3D();
+        planetMeshInstance.Mesh = planetMesh;
+        
+        var material = new StandardMaterial3D();
+        material.AlbedoColor = Colors.White;
+        material.VertexColorUseAsAlbedo = true;
+        material.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        planetMeshInstance.SetSurfaceOverrideMaterial(0, material);
+        
+        planet.AddChild(planetMeshInstance);
+    }
+
+    private void RenderHeightmapVisualization()
+    {
         // Create a single surface tool for the entire planet
         var surfaceTool = new SurfaceTool();
         surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
@@ -93,15 +164,217 @@ public partial class SphericalPlanetView : Node3D
         planetMeshInstance.Mesh = planetMesh;
         
         var material = new StandardMaterial3D();
-        material.AlbedoColor = useHeightmapColoring ? Colors.White : Colors.White;
+        material.AlbedoColor = Colors.White;
+        material.VertexColorUseAsAlbedo = true;
+        material.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        planetMeshInstance.SetSurfaceOverrideMaterial(0, material);
+        
+        planet.AddChild(planetMeshInstance);
+    }
+
+    private void RenderPlateVisualization()
+    {
+        // Create a single surface tool for the entire planet
+        var surfaceTool = new SurfaceTool();
+        surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
+
+        foreach (Hexagon cell in planet.AllCells)
+        {
+            var plate = planet.GetPlateForHex(cell.ToStrId());
+            Color cellColor = plate != null 
+                ? GetPlateColor(plate)
+                : new Color(0.5f, 0.5f, 0.5f); // Gray for unassigned
+            
+            if (showMarkers)
+                CreateCellMarkerGeometry(cell, cellColor, surfaceTool);
+            else
+                CreateCellPolygonGeometryPlain(cell, cellColor, surfaceTool);
+        }
+
+        // Commit the combined mesh
+        var planetMesh = surfaceTool.Commit();
+        planetMeshInstance = new MeshInstance3D();
+        planetMeshInstance.Mesh = planetMesh;
+        
+        var material = new StandardMaterial3D();
+        material.AlbedoColor = Colors.White;
         material.VertexColorUseAsAlbedo = true;
         material.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
         planetMeshInstance.SetSurfaceOverrideMaterial(0, material);
         
         planet.AddChild(planetMeshInstance);
 
-        if (invalidCenterCount > 0)
-            GD.PrintErr($"Skipped {invalidCenterCount} cells during rendering due to non-finite projection results.");
+        // Render drift direction arrows for each plate
+        RenderPlateDriftDirections();
+    }
+
+    private Color GetPlateColor(TectonicPlate plate)
+    {
+        // Color by plate type with narrow hue ranges for clear distinction
+        float variation = (float)plate.plateId / Mathf.Max(planet.Plates.Count, 1);
+        
+        switch (plate.type)
+        {
+            case PlateType.Continental:
+                // Brown/tan range (hue 0.08-0.15, orange-brown)
+                return Color.FromHsv(0.08f + variation * 0.07f, 0.5f, 0.6f);
+            case PlateType.Oceanic:
+                // Blue range (hue 0.55-0.62, blue)
+                return Color.FromHsv(0.55f + variation * 0.07f, 0.6f, 0.7f);
+            case PlateType.Micro:
+                // Green range (hue 0.28-0.40, green-cyan) for micro plates
+                return Color.FromHsv(0.28f + variation * 0.12f, 0.7f, 0.75f);
+            default:
+                return new Color(0.5f, 0.5f, 0.5f);
+        }
+    }
+
+    private void RenderPlateDriftDirections()
+    {
+        // Draw arrows showing drift direction for each plate
+        foreach (var plate in planet.Plates)
+        {
+            if (plate.hexIds.Count == 0)
+                continue;
+
+            // Find the center of the plate (average position)
+            Vector3 plateCenter = Vector3.Zero;
+            int validCount = 0;
+            
+            foreach (string hexId in plate.hexIds)
+            {
+                var hex = planet.GetCellById(hexId);
+                if (hex != null)
+                {
+                    Vector3 pos = planet.Grid.projection.InvProject(hex.P, hex.face).Normalized() * visualRadius;
+                    if (IsFinite(pos))
+                    {
+                        plateCenter += pos;
+                        validCount++;
+                    }
+                }
+            }
+            
+            if (validCount == 0)
+                continue;
+                
+            plateCenter /= validCount;
+            plateCenter = plateCenter.Normalized() * visualRadius;
+
+            // Convert drift direction (lat/lon) to a 3D vector
+            Vector3 driftDir = SphericalGeometry.LatLonToVector3(plate.driftLatitude, plate.driftLongitude);
+            
+            // Project drift direction onto the tangent plane at plateCenter
+            Vector3 normal = plateCenter.Normalized();
+            Vector3 tangentDrift = (driftDir - normal * driftDir.Dot(normal)).Normalized();
+            
+            // Create arrow mesh
+            float arrowLength = 0.5f * plate.driftSpeed;
+            Vector3 arrowEnd = plateCenter + tangentDrift * arrowLength;
+            
+            DrawArrow(plateCenter, arrowEnd, GetPlateColor(plate));
+        }
+    }
+
+    private void DrawArrow(Vector3 start, Vector3 end, Color color)
+    {
+        // Create a simple arrow using ImmediateMesh for lines
+        var arrowMesh = new ImmediateMesh();
+        
+        // Draw line using ImmediateMesh - must be done before creating instance
+        arrowMesh.SurfaceBegin(Mesh.PrimitiveType.Lines);
+        arrowMesh.SurfaceAddVertex(start);
+        arrowMesh.SurfaceAddVertex(end);
+        arrowMesh.SurfaceEnd();
+        
+        // Now create the mesh instance
+        var arrowInstance = new MeshInstance3D();
+        arrowInstance.Mesh = arrowMesh;
+        
+        // Set material after surface exists
+        var lineMaterial = new StandardMaterial3D();
+        lineMaterial.AlbedoColor = color;
+        lineMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        lineMaterial.VertexColorUseAsAlbedo = false;
+        arrowInstance.SetSurfaceOverrideMaterial(0, lineMaterial);
+        
+        planet.AddChild(arrowInstance);
+    }
+
+    private void RenderTectonicHeightmapVisualization()
+    {
+        // Create a single surface tool for the entire planet
+        var surfaceTool = new SurfaceTool();
+        surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
+
+        if (!planet.HasTectonicHeights)
+        {
+            GD.PrintErr("No tectonic heightmap data available. Generate plates first.");
+            return;
+        }
+
+        foreach (Hexagon cell in planet.AllCells)
+        {
+            bool isPentagon = IsPentagon(cell);
+            Color cellColor = isPentagon ? pentagonColor : hexColor;
+            
+            if (showMarkers)
+                CreateCellMarkerGeometry(cell, cellColor, surfaceTool);
+            else
+                CreateCellPolygonGeometryTectonic(cell, cellColor, surfaceTool);
+        }
+
+        // Commit the combined mesh
+        var planetMesh = surfaceTool.Commit();
+        planetMeshInstance = new MeshInstance3D();
+        planetMeshInstance.Mesh = planetMesh;
+        
+        var material = new StandardMaterial3D();
+        material.AlbedoColor = Colors.White;
+        material.VertexColorUseAsAlbedo = true;
+        material.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        planetMeshInstance.SetSurfaceOverrideMaterial(0, material);
+        
+        planet.AddChild(planetMeshInstance);
+    }
+
+    private void RenderTectonicTextureVisualization()
+    {
+        // Create a single surface tool for the entire planet
+        var surfaceTool = new SurfaceTool();
+        surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
+
+        // Get the NoiseHeightmapGenerator to sample from
+        var heightmapGen = planet.GetHeightmapGenerator() as NoiseHeightmapGenerator;
+        if (heightmapGen == null)
+        {
+            GD.PrintErr("No NoiseHeightmapGenerator found. Add one to Planet node.");
+            return;
+        }
+
+        foreach (Hexagon cell in planet.AllCells)
+        {
+            bool isPentagon = IsPentagon(cell);
+            Color cellColor = isPentagon ? pentagonColor : hexColor;
+            
+            if (showMarkers)
+                CreateCellMarkerGeometry(cell, cellColor, surfaceTool);
+            else
+                CreateCellPolygonGeometryTectonicTexture(cell, cellColor, surfaceTool, heightmapGen);
+        }
+
+        // Commit the combined mesh
+        var planetMesh = surfaceTool.Commit();
+        planetMeshInstance = new MeshInstance3D();
+        planetMeshInstance.Mesh = planetMesh;
+        
+        var material = new StandardMaterial3D();
+        material.AlbedoColor = Colors.White;
+        material.VertexColorUseAsAlbedo = true;
+        material.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        planetMeshInstance.SetSurfaceOverrideMaterial(0, material);
+        
+        planet.AddChild(planetMeshInstance);
     }
 
     /// <summary>
@@ -268,9 +541,6 @@ public partial class SphericalPlanetView : Node3D
     #region Private Methods - Rendering
     private Color GetHeightColor(Vector3 position)
     {
-        if (!useHeightmapColoring)
-            return Colors.White; // Return neutral color if heightmap coloring disabled
-
         Vector3 normalized = position.Normalized();
         var (lat, lon) = SphericalGeometry.Vector3ToLatLon(normalized);
         float height = planet.GetHeightAtLatLon(lat, lon);
@@ -305,16 +575,6 @@ public partial class SphericalPlanetView : Node3D
             return;
         }
 
-        // Sample heightmap at marker position if enabled
-        Color markerColor = color;
-        if (useHeightmapColoring)
-        {
-            Vector3 centerNormalized = center.Normalized();
-            var (lat, lon) = SphericalGeometry.Vector3ToLatLon(centerNormalized);
-            float height = planet.GetHeightAtLatLon(lat, lon);
-            markerColor = HeightToColor(height, planet.SeaLevel);
-        }
-
         // Store geometry (for markers, just store the center as a single point)
         cellGeometry[hexId] = (center, new List<Vector3> { center });
 
@@ -330,11 +590,102 @@ public partial class SphericalPlanetView : Node3D
         meshInstance.Position = center;
 
         var material = new StandardMaterial3D();
-        material.AlbedoColor = markerColor;
+        material.AlbedoColor = color;
         material.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
         meshInstance.SetSurfaceOverrideMaterial(0, material);
 
         planet.AddChild(meshInstance);
+    }
+
+    private void CreateCellPolygonGeometryPlain(Hexagon hex, Color color, SurfaceTool surfaceTool)
+    {
+        (int dx, int dy, int dz)[] directions = new (int, int, int)[]
+        {
+            (1, -1, 0), (1, 0, -1), (0, 1, -1),
+            (-1, 1, 0), (-1, 0, 1), (0, -1, 1)
+        };
+
+        Vector3 center = planet.Grid.projection.InvProject(hex.P, hex.face).Normalized() * visualRadius;
+        string hexId = hex.ToStrId();
+        if (!IsFinite(center))
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Get unique neighbors in circular order
+        List<(string id, Vector3 pos)> uniqueNeighbors = new List<(string, Vector3)>();
+        HashSet<string> seenIds = new HashSet<string>();
+        
+        for (int i = 0; i < directions.Length; i++)
+        {
+            var d = directions[i];
+            Hexagon neighbor = hex.ComputeNeighbor(d);
+            string neighborId = neighbor.ToStrId();
+            Vector3 neighborCenter = planet.Grid.projection.InvProject(neighbor.P, neighbor.face).Normalized() * visualRadius;
+            
+            if (IsFinite(neighborCenter) && !seenIds.Contains(neighborId))
+            {
+                uniqueNeighbors.Add((neighborId, neighborCenter));
+                seenIds.Add(neighborId);
+            }
+        }
+
+        // Compute boundary vertices where three cells meet
+        List<Vector3> vertices = new List<Vector3>();
+        for (int i = 0; i < uniqueNeighbors.Count; i++)
+        {
+            int nextIdx = (i + 1) % uniqueNeighbors.Count;
+            
+            Vector3 n1 = uniqueNeighbors[i].pos;
+            Vector3 n2 = uniqueNeighbors[nextIdx].pos;
+            
+            Vector3 vertex = ((center + n1 + n2) / 3.0f).Normalized() * visualRadius;
+            if (IsFinite(vertex))
+                vertices.Add(vertex);
+        }
+
+        if (vertices.Count < 3)
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Store geometry for highlighting
+        cellGeometry[hexId] = (center, new List<Vector3>(vertices));
+
+        // Use uniform color (no heightmap sampling)
+        Dictionary<Vector3, Color> vertexColors = new Dictionary<Vector3, Color>();
+        foreach (Vector3 vertex in vertices)
+        {
+            vertexColors[vertex] = color;
+        }
+
+        // Add triangles to the shared surfaceTool with subdivision per wedge
+        // Pentagons: 5 vertices × 4 triangles = 20 triangles
+        // Hexagons: 6 vertices × 4 triangles = 24 triangles
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 v1 = vertices[i];
+            Vector3 v2 = vertices[(i + 1) % vertices.Count];
+
+            // Compute subdivision points for this wedge
+            Vector3 edgeMid = ((v1 + v2) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid1 = ((center + v1) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid2 = ((center + v2) / 2.0f).Normalized() * visualRadius;
+
+            // Triangle 1: Center, innerMid1, innerMid2
+            AddTriangleToMesh(surfaceTool, center, color, innerMid1, color, innerMid2, color);
+
+            // Triangle 2: innerMid1, v1, edgeMid
+            AddTriangleToMesh(surfaceTool, innerMid1, color, v1, vertexColors[v1], edgeMid, color);
+
+            // Triangle 3: innerMid2, edgeMid, v2
+            AddTriangleToMesh(surfaceTool, innerMid2, color, edgeMid, color, v2, vertexColors[v2]);
+
+            // Triangle 4: innerMid1, edgeMid, innerMid2
+            AddTriangleToMesh(surfaceTool, innerMid1, color, edgeMid, color, innerMid2, color);
+        }
     }
 
     private void CreateCellPolygonGeometry(Hexagon hex, Color color, SurfaceTool surfaceTool)
@@ -394,34 +745,21 @@ public partial class SphericalPlanetView : Node3D
         // Store geometry for highlighting
         cellGeometry[hexId] = (center, new List<Vector3>(vertices));
 
-        // Sample heightmap at vertices if enabled
+        // Sample height at center by converting to lat/lon first
         Color centerColor = color;
-        Dictionary<Vector3, Color> vertexColors = new Dictionary<Vector3, Color>();
+        Vector3 centerNormalized = center.Normalized();
+        var (centerLat, centerLon) = SphericalGeometry.Vector3ToLatLon(centerNormalized);
+        float centerHeight = planet.GetHeightAtLatLon(centerLat, centerLon);
+        centerColor = HeightToColor(centerHeight, planet.SeaLevel);
         
-        if (useHeightmapColoring)
+        // Sample height at each vertex by converting to lat/lon
+        Dictionary<Vector3, Color> vertexColors = new Dictionary<Vector3, Color>();
+        foreach (Vector3 vertex in vertices)
         {
-            // Sample height at center by converting to lat/lon first
-            Vector3 centerNormalized = center.Normalized();
-            var (centerLat, centerLon) = SphericalGeometry.Vector3ToLatLon(centerNormalized);
-            float centerHeight = planet.GetHeightAtLatLon(centerLat, centerLon);
-            centerColor = HeightToColor(centerHeight, planet.SeaLevel);
-            
-            // Sample height at each vertex by converting to lat/lon
-            foreach (Vector3 vertex in vertices)
-            {
-                Vector3 vertexNormalized = vertex.Normalized();
-                var (vertexLat, vertexLon) = SphericalGeometry.Vector3ToLatLon(vertexNormalized);
-                float vertexHeight = planet.GetHeightAtLatLon(vertexLat, vertexLon);
-                vertexColors[vertex] = HeightToColor(vertexHeight, planet.SeaLevel);
-            }
-        }
-        else
-        {
-            // Use uniform color
-            foreach (Vector3 vertex in vertices)
-            {
-                vertexColors[vertex] = color;
-            }
+            Vector3 vertexNormalized = vertex.Normalized();
+            var (vertexLat, vertexLon) = SphericalGeometry.Vector3ToLatLon(vertexNormalized);
+            float vertexHeight = planet.GetHeightAtLatLon(vertexLat, vertexLon);
+            vertexColors[vertex] = HeightToColor(vertexHeight, planet.SeaLevel);
         }
 
         // Add triangles to the shared surfaceTool with subdivision per wedge
@@ -441,6 +779,226 @@ public partial class SphericalPlanetView : Node3D
             Color edgeMidColor = GetHeightColor(edgeMid);
             Color innerMid1Color = GetHeightColor(innerMid1);
             Color innerMid2Color = GetHeightColor(innerMid2);
+
+            // Triangle 1: Center, innerMid1, innerMid2
+            AddTriangleToMesh(surfaceTool, center, centerColor, innerMid1, innerMid1Color, innerMid2, innerMid2Color);
+
+            // Triangle 2: innerMid1, v1, edgeMid
+            AddTriangleToMesh(surfaceTool, innerMid1, innerMid1Color, v1, vertexColors[v1], edgeMid, edgeMidColor);
+
+            // Triangle 3: innerMid2, edgeMid, v2
+            AddTriangleToMesh(surfaceTool, innerMid2, innerMid2Color, edgeMid, edgeMidColor, v2, vertexColors[v2]);
+
+            // Triangle 4: innerMid1, edgeMid, innerMid2
+            AddTriangleToMesh(surfaceTool, innerMid1, innerMid1Color, edgeMid, edgeMidColor, innerMid2, innerMid2Color);
+        }
+    }
+
+    private void CreateCellPolygonGeometryTectonic(Hexagon hex, Color color, SurfaceTool surfaceTool)
+    {
+        (int dx, int dy, int dz)[] directions = new (int, int, int)[]
+        {
+            (1, -1, 0), (1, 0, -1), (0, 1, -1),
+            (-1, 1, 0), (-1, 0, 1), (0, -1, 1)
+        };
+
+        Vector3 center = planet.Grid.projection.InvProject(hex.P, hex.face).Normalized() * visualRadius;
+        string hexId = hex.ToStrId();
+        if (!IsFinite(center))
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Get unique neighbors in circular order
+        List<(string id, Vector3 pos)> uniqueNeighbors = new List<(string, Vector3)>();
+        HashSet<string> seenIds = new HashSet<string>();
+        
+        for (int i = 0; i < directions.Length; i++)
+        {
+            var d = directions[i];
+            Hexagon neighbor = hex.ComputeNeighbor(d);
+            string neighborId = neighbor.ToStrId();
+            Vector3 neighborCenter = planet.Grid.projection.InvProject(neighbor.P, neighbor.face).Normalized() * visualRadius;
+            
+            if (IsFinite(neighborCenter) && !seenIds.Contains(neighborId))
+            {
+                uniqueNeighbors.Add((neighborId, neighborCenter));
+                seenIds.Add(neighborId);
+            }
+        }
+
+        // Compute boundary vertices where three cells meet
+        List<Vector3> vertices = new List<Vector3>();
+        for (int i = 0; i < uniqueNeighbors.Count; i++)
+        {
+            int nextIdx = (i + 1) % uniqueNeighbors.Count;
+            
+            Vector3 n1 = uniqueNeighbors[i].pos;
+            Vector3 n2 = uniqueNeighbors[nextIdx].pos;
+            
+            Vector3 vertex = ((center + n1 + n2) / 3.0f).Normalized() * visualRadius;
+            if (IsFinite(vertex))
+                vertices.Add(vertex);
+        }
+
+        if (vertices.Count < 3)
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Store geometry for highlighting
+        cellGeometry[hexId] = (center, new List<Vector3>(vertices));
+
+        // Get tectonic height at center
+        float centerHeight = planet.GetTectonicHeightAtHex(hexId);
+        Color centerColor = HeightToColor(centerHeight, planet.SeaLevel);
+        
+        // Get tectonic height at each vertex (use nearest hex for vertex)
+        Dictionary<Vector3, Color> vertexColors = new Dictionary<Vector3, Color>();
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            // Vertex is between this hex and two neighbors
+            int nextIdx = (i + 1) % uniqueNeighbors.Count;
+            string n1Id = uniqueNeighbors[i].id;
+            string n2Id = uniqueNeighbors[nextIdx].id;
+            
+            // Average heights of the three adjacent hexes
+            float h1 = planet.GetTectonicHeightAtHex(hexId);
+            float h2 = planet.GetTectonicHeightAtHex(n1Id);
+            float h3 = planet.GetTectonicHeightAtHex(n2Id);
+            float vertexHeight = (h1 + h2 + h3) / 3.0f;
+            
+            vertexColors[vertices[i]] = HeightToColor(vertexHeight, planet.SeaLevel);
+        }
+
+        // Add triangles to the shared surfaceTool with subdivision per wedge
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 v1 = vertices[i];
+            Vector3 v2 = vertices[(i + 1) % vertices.Count];
+
+            // Compute subdivision points for this wedge
+            Vector3 edgeMid = ((v1 + v2) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid1 = ((center + v1) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid2 = ((center + v2) / 2.0f).Normalized() * visualRadius;
+
+            // Interpolate colors at subdivision points
+            Color edgeMidColor = vertexColors[v1].Lerp(vertexColors[v2], 0.5f);
+            Color innerMid1Color = centerColor.Lerp(vertexColors[v1], 0.5f);
+            Color innerMid2Color = centerColor.Lerp(vertexColors[v2], 0.5f);
+
+            // Triangle 1: Center, innerMid1, innerMid2
+            AddTriangleToMesh(surfaceTool, center, centerColor, innerMid1, innerMid1Color, innerMid2, innerMid2Color);
+
+            // Triangle 2: innerMid1, v1, edgeMid
+            AddTriangleToMesh(surfaceTool, innerMid1, innerMid1Color, v1, vertexColors[v1], edgeMid, edgeMidColor);
+
+            // Triangle 3: innerMid2, edgeMid, v2
+            AddTriangleToMesh(surfaceTool, innerMid2, innerMid2Color, edgeMid, edgeMidColor, v2, vertexColors[v2]);
+
+            // Triangle 4: innerMid1, edgeMid, innerMid2
+            AddTriangleToMesh(surfaceTool, innerMid1, innerMid1Color, edgeMid, edgeMidColor, innerMid2, innerMid2Color);
+        }
+    }
+
+    private void CreateCellPolygonGeometryTectonicTexture(Hexagon hex, Color color, SurfaceTool surfaceTool, NoiseHeightmapGenerator heightmapGen)
+    {
+        (int dx, int dy, int dz)[] directions = new (int, int, int)[]
+        {
+            (1, -1, 0), (1, 0, -1), (0, 1, -1),
+            (-1, 1, 0), (-1, 0, 1), (0, -1, 1)
+        };
+
+        Vector3 center = planet.Grid.projection.InvProject(hex.P, hex.face).Normalized() * visualRadius;
+        string hexId = hex.ToStrId();
+        if (!IsFinite(center))
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Get unique neighbors in circular order
+        List<(string id, Vector3 pos)> uniqueNeighbors = new List<(string, Vector3)>();
+        HashSet<string> seenIds = new HashSet<string>();
+        
+        for (int i = 0; i < directions.Length; i++)
+        {
+            var d = directions[i];
+            Hexagon neighbor = hex.ComputeNeighbor(d);
+            string neighborId = neighbor.ToStrId();
+            Vector3 neighborCenter = planet.Grid.projection.InvProject(neighbor.P, neighbor.face).Normalized() * visualRadius;
+            
+            if (IsFinite(neighborCenter) && !seenIds.Contains(neighborId))
+            {
+                uniqueNeighbors.Add((neighborId, neighborCenter));
+                seenIds.Add(neighborId);
+            }
+        }
+
+        // Compute boundary vertices where three cells meet
+        List<Vector3> vertices = new List<Vector3>();
+        for (int i = 0; i < uniqueNeighbors.Count; i++)
+        {
+            int nextIdx = (i + 1) % uniqueNeighbors.Count;
+            
+            Vector3 n1 = uniqueNeighbors[i].pos;
+            Vector3 n2 = uniqueNeighbors[nextIdx].pos;
+            
+            Vector3 vertex = ((center + n1 + n2) / 3.0f).Normalized() * visualRadius;
+            if (IsFinite(vertex))
+                vertices.Add(vertex);
+        }
+
+        if (vertices.Count < 3)
+        {
+            invalidCenterCount++;
+            return;
+        }
+
+        // Store geometry for highlighting
+        cellGeometry[hexId] = (center, new List<Vector3>(vertices));
+
+        // Sample heightmap at center
+        Vector3 centerNorm = center.Normalized();
+        var (centerLat, centerLon) = SphericalGeometry.Vector3ToLatLon(centerNorm);
+        float centerHeight = heightmapGen.GetRawHeightAtLatLon(centerLat, centerLon);
+        Color centerColor = HeightToBlueRedColor(centerHeight);
+        
+        // Sample heightmap at each vertex
+        Dictionary<Vector3, Color> vertexColors = new Dictionary<Vector3, Color>();
+        foreach (Vector3 vertex in vertices)
+        {
+            Vector3 vertexNorm = vertex.Normalized();
+            var (vertexLat, vertexLon) = SphericalGeometry.Vector3ToLatLon(vertexNorm);
+            float vertexHeight = heightmapGen.GetRawHeightAtLatLon(vertexLat, vertexLon);
+            vertexColors[vertex] = HeightToBlueRedColor(vertexHeight);
+        }
+
+        // Add triangles to the shared surfaceTool with subdivision per wedge
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 v1 = vertices[i];
+            Vector3 v2 = vertices[(i + 1) % vertices.Count];
+
+            // Compute subdivision points for this wedge
+            Vector3 edgeMid = ((v1 + v2) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid1 = ((center + v1) / 2.0f).Normalized() * visualRadius;
+            Vector3 innerMid2 = ((center + v2) / 2.0f).Normalized() * visualRadius;
+
+            // Sample heightmap at subdivision points
+            Vector3 edgeMidNorm = edgeMid.Normalized();
+            var (edgeLat, edgeLon) = SphericalGeometry.Vector3ToLatLon(edgeMidNorm);
+            Color edgeMidColor = HeightToBlueRedColor(heightmapGen.GetRawHeightAtLatLon(edgeLat, edgeLon));
+
+            Vector3 inner1Norm = innerMid1.Normalized();
+            var (inner1Lat, inner1Lon) = SphericalGeometry.Vector3ToLatLon(inner1Norm);
+            Color innerMid1Color = HeightToBlueRedColor(heightmapGen.GetRawHeightAtLatLon(inner1Lat, inner1Lon));
+
+            Vector3 inner2Norm = innerMid2.Normalized();
+            var (inner2Lat, inner2Lon) = SphericalGeometry.Vector3ToLatLon(inner2Norm);
+            Color innerMid2Color = HeightToBlueRedColor(heightmapGen.GetRawHeightAtLatLon(inner2Lat, inner2Lon));
 
             // Triangle 1: Center, innerMid1, innerMid2
             AddTriangleToMesh(surfaceTool, center, centerColor, innerMid1, innerMid1Color, innerMid2, innerMid2Color);
@@ -540,6 +1098,45 @@ public partial class SphericalPlanetView : Node3D
             
             float t = (height - seaLevel) / landRange;
             return lowLandColor.Lerp(highLandColor, t);
+        }
+    }
+
+    /// <summary>
+    /// Converts a height value (0-1) to a color from blue (low) to red (high)
+    /// </summary>
+    private Color HeightToBlueRedColor(float height)
+    {
+        height = Mathf.Clamp(height, 0.0f, 1.0f);
+        
+        // Blue (0, 0, 1) at height 0
+        // Cyan (0, 1, 1) at height 0.25
+        // Green (0, 1, 0) at height 0.5
+        // Yellow (1, 1, 0) at height 0.75
+        // Red (1, 0, 0) at height 1.0
+        
+        if (height < 0.25f)
+        {
+            // Blue to Cyan
+            float t = height / 0.25f;
+            return new Color(0, t, 1);
+        }
+        else if (height < 0.5f)
+        {
+            // Cyan to Green
+            float t = (height - 0.25f) / 0.25f;
+            return new Color(0, 1, 1 - t);
+        }
+        else if (height < 0.75f)
+        {
+            // Green to Yellow
+            float t = (height - 0.5f) / 0.25f;
+            return new Color(t, 1, 0);
+        }
+        else
+        {
+            // Yellow to Red
+            float t = (height - 0.75f) / 0.25f;
+            return new Color(1, 1 - t, 0);
         }
     }
     #endregion
